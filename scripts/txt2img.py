@@ -23,12 +23,6 @@ from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionS
 from transformers import AutoFeatureExtractor
 
 
-# load safety model
-safety_model_id = "CompVis/stable-diffusion-safety-checker"
-safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
-safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
-
-
 def chunk(it, size):
     it = iter(it)
     return iter(lambda: tuple(islice(it, size)), ())
@@ -46,13 +40,14 @@ def numpy_to_pil(images):
     return pil_images
 
 
-def load_model_from_config(config, ckpt, verbose=False):
+def load_model_from_config(config, ckpt, half_precision=False, verbose=False):
     print(f"Loading model from {ckpt}")
     pl_sd = torch.load(ckpt, map_location="cpu")
     if "global_step" in pl_sd:
         print(f"Global Step: {pl_sd['global_step']}")
     sd = pl_sd["state_dict"]
     model = instantiate_from_config(config.model)
+    import pdb; pdb.set_trace()
     m, u = model.load_state_dict(sd, strict=False)
     if len(m) > 0 and verbose:
         print("missing keys:")
@@ -61,7 +56,10 @@ def load_model_from_config(config, ckpt, verbose=False):
         print("unexpected keys:")
         print(u)
 
-    model.cuda()
+    if half_precision:
+        model.cuda().half()
+    else:
+        model.cuda()
     model.eval()
     return model
 
@@ -85,7 +83,7 @@ def load_replacement(x):
         return x
 
 
-def check_safety(x_image):
+def check_safety(x_image, safety_feature_extractor, safety_checker):
     safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
     x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
     assert x_checked_image.shape[0] == len(has_nsfw_concept)
@@ -232,6 +230,16 @@ def main():
         choices=["full", "autocast"],
         default="autocast"
     )
+    parser.add_argument(
+        "--half-precision",
+        action='store_true',
+        help="Load the model in half precision https://github.com/CompVis/stable-diffusion/issues/86#issuecomment-1230309710",
+    )
+    parser.add_argument(
+        "--check-safety",
+        action='store_true',
+        help="Enable safety check https://github.com/CompVis/stable-diffusion/issues/86#issuecomment-1231670747",
+    )
     opt = parser.parse_args()
 
     if opt.laion400m:
@@ -243,7 +251,14 @@ def main():
     seed_everything(opt.seed)
 
     config = OmegaConf.load(f"{opt.config}")
-    model = load_model_from_config(config, f"{opt.ckpt}")
+    model = load_model_from_config(config, f"{opt.ckpt}", half_precision=opt.half_precision)
+
+
+    if opt.check_safety:
+        # load safety model
+        safety_model_id = "CompVis/stable-diffusion-safety-checker"
+        safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
+        safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = model.to(device)
@@ -314,7 +329,13 @@ def main():
                         x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
                         x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
 
-                        x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                        if opt.check_safety:
+                            x_checked_image, has_nsfw_concept = check_safety(
+                                x_samples_ddim,
+                                safety_feature_extractor,
+                                safety_checker)
+                        else:
+                            x_checked_image = x_samples_ddim
 
                         x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
